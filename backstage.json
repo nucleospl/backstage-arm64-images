@@ -1,7 +1,7 @@
 {
-  "last_built":     "none",
-  "last_built_sha": "none",
-  "built_at":       "",
+  "last_built":     "v1.46.2",
+  "last_built_sha": "37e56116ee2d63c1b024d3b306dac5a0b7a4ca02",
+  "built_at":       "2026-06-06T19:47:17Z",
   "registry":       "ghcr.io/nucleospl/backstage-arm64-images",
   "image":          "ghcr.io/nucleospl/backstage-arm64-images/app",
   "source_repo":    "nucleospl/homelab-backstage"
