@@ -1,0 +1,239 @@
+name: Build Backstage Images (amd64 + arm64)
+
+# Buduje obraz Backstage dla linux/amd64 i linux/arm64.
+# Używa natywnych runnerów — bez QEMU, bez emulacji.
+# Źródło: nucleospl/homelab-backstage, pinowane po commit SHA.
+# Obrazy skanowane Trivym, pushowane do GHCR i podpisywane cosign (keyless OIDC).
+
+on:
+  workflow_dispatch:
+    inputs:
+      backstage_version:
+        description: 'Wersja (tag z homelab-backstage, np. v1.0.0)'
+        required: true
+        type: string
+      backstage_sha:
+        description: 'Commit SHA (pinned, nie tag)'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # zapis backstage.json + tworzenie GitHub Release
+  packages: write   # push do GHCR
+  id-token: write   # cosign keyless (OIDC)
+
+env:
+  GHCR_REGISTRY:   ghcr.io
+  IMAGE:           ghcr.io/nucleospl/backstage-arm64-images/app
+  VERSION:         ${{ inputs.backstage_version }}
+  SOURCE_SHA:      ${{ inputs.backstage_sha }}
+
+jobs:
+  # ── Build AMD64 ─────────────────────────────────────────────────────────────
+  build-amd64:
+    name: Build linux/amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone homelab-backstage at pinned SHA
+        run: |
+          git clone https://github.com/nucleospl/homelab-backstage.git src
+          cd src
+          git checkout "${{ env.SOURCE_SHA }}"
+
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "${{ env.SOURCE_SHA }}" ]; then
+            echo "::error::SHA mismatch! expected=${{ env.SOURCE_SHA }} actual=$ACTUAL"
+            exit 1
+          fi
+          echo "Verified SHA: $ACTUAL"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push linux/amd64
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile.multi
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+
+  # ── Build ARM64 ─────────────────────────────────────────────────────────────
+  build-arm64:
+    name: Build linux/arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone homelab-backstage at pinned SHA
+        run: |
+          git clone https://github.com/nucleospl/homelab-backstage.git src
+          cd src
+          git checkout "${{ env.SOURCE_SHA }}"
+
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "${{ env.SOURCE_SHA }}" ]; then
+            echo "::error::SHA mismatch! expected=${{ env.SOURCE_SHA }} actual=$ACTUAL"
+            exit 1
+          fi
+          echo "Verified SHA: $ACTUAL"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push linux/arm64
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile.multi
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+  # ── Merge manifest list ─────────────────────────────────────────────────────
+  merge:
+    name: Create multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64]
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifest list
+        id: merge
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.IMAGE }}:${{ env.VERSION }}" \
+            --tag "${{ env.IMAGE }}:latest" \
+            "${{ env.IMAGE }}:${{ env.VERSION }}-amd64" \
+            "${{ env.IMAGE }}:${{ env.VERSION }}-arm64"
+
+          DIGEST=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ env.VERSION }}" \
+            --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Multi-arch manifest: ${{ env.IMAGE }}:${{ env.VERSION }}@${DIGEST}"
+
+  # ── Scan + Sign + Release ───────────────────────────────────────────────────
+  publish:
+    name: Scan, sign, release
+    runs-on: ubuntu-latest
+    needs: [merge]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy scan — app image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE }}:${{ env.VERSION }}'
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign keyless
+        run: |
+          DIGEST="${{ needs.merge.outputs.digest }}"
+          cosign sign --yes "${{ env.IMAGE }}@${DIGEST}"
+          echo "Signed: ${{ env.IMAGE }}@${DIGEST}"
+
+      - name: Update backstage.json
+        run: |
+          cat > backstage.json <<EOF
+          {
+            "last_built":     "${{ env.VERSION }}",
+            "last_built_sha": "${{ env.SOURCE_SHA }}",
+            "built_at":       "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "registry":       "${{ env.GHCR_REGISTRY }}/nucleospl/backstage-arm64-images",
+            "image":          "${{ env.IMAGE }}",
+            "source_repo":    "nucleospl/homelab-backstage"
+          }
+          EOF
+
+      - name: Commit & push backstage.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add backstage.json
+          git diff --cached --quiet \
+            || git commit -m "chore: built Backstage ${{ env.VERSION }} [skip ci]"
+          git push
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ env.VERSION }}" \
+            --repo "${{ github.repository }}" \
+            --title "Backstage ${{ env.VERSION }}" \
+            --notes "$(cat <<EOF
+          ## Backstage ${{ env.VERSION }}
+
+          Multi-arch image built from [nucleospl/homelab-backstage@\`${{ env.SOURCE_SHA }}\`](https://github.com/nucleospl/homelab-backstage/commit/${{ env.SOURCE_SHA }}).
+
+          ### Images
+
+          | Platform | Tag |
+          |---|---|
+          | linux/amd64 + linux/arm64 | \`${{ env.IMAGE }}:${{ env.VERSION }}\` |
+          | linux/amd64 | \`${{ env.IMAGE }}:${{ env.VERSION }}-amd64\` |
+          | linux/arm64 | \`${{ env.IMAGE }}:${{ env.VERSION }}-arm64\` |
+
+          ### Verification (cosign)
+
+          \`\`\`bash
+          cosign verify \\
+            --certificate-identity-regexp="https://github.com/nucleospl/backstage-arm64-images/.*" \\
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+          \`\`\`
+          EOF
+          )" \
+            --latest
